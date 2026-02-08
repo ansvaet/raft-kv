@@ -41,10 +41,7 @@ A distributed key-value in-memory store implementation using the Raft consensus 
 
 ### Build
 ```bash
-# Using Make
-make
-
-# Or using CMake
+# using CMake
 mkdir build && cd build
 cmake ..
 make
