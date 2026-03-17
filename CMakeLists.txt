@@ -39,6 +39,8 @@ endforeach()
 
 
 add_executable(raft_kv ${SOURCES} "src/raft/serialize.cpp")
+add_subdirectory(tests/integration)
+
 
 target_link_libraries(raft_kv PRIVATE nlohmann_json::nlohmann_json)
 

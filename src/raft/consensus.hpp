@@ -47,7 +47,7 @@ namespace raft {
 
 
         uint32_t get_leader_id() const {
-            return (state_ == NodeState::LEADER) ? config_.node_id : leader_id_;
+            return (state_ == NodeState::LEADER) ? config_.node_id : leader_id_.load();
         }
 
     private:

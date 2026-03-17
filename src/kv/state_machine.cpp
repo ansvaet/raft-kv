@@ -1,6 +1,7 @@
 #include "state_machine.hpp"
 #include "../../include/kv/command.hpp"
 #include <iostream>
+#include <mutex>
 
 namespace kv {
 
