@@ -19,6 +19,12 @@ namespace raft {
         virtual uint32_t get_id() const = 0;
         virtual bool is_leader() const = 0;
 
+        // Потокобезопасно. callback вызывается ровно один раз из потока узла;
+        // он должен быть быстрым и не вызывать блокирующий propose()
+        virtual void propose_async(std::string command_data, ProposeCallback callback) = 0;
+
+        // Блокирующая обёртка над propose_async: true, если команда закоммичена
+        // и применена. Нельзя вызывать из callback узла
         virtual bool propose(const std::string& command_data, std::string& result) = 0;
 
         virtual bool query(const std::string& query_data, std::string& result) = 0;

@@ -1,5 +1,4 @@
 #include "consensus.hpp"
-#include "../include/kv/command.hpp"
 #include "../network/virtual_transport.hpp" 
 #include "serializer.hpp"
 #include <random>
@@ -53,12 +52,17 @@ namespace raft {
             break;
 
         case NodeState::LEADER:
-            send_heartbeats();
-            apply_committed_entries();
+            if (replicate_now_) {
+                send_append_entries_to_all();
+            }
+            else {
+                send_heartbeats();
+            }
             update_commit_index();
             break;
         }
         apply_committed_entries();
+        expire_pending();
     }
 
     void ConsensusEngine::handle_message(const std::string& type, const std::string& data, uint32_t from) {
@@ -98,61 +102,55 @@ namespace raft {
         }
     }
 
-    bool ConsensusEngine::propose_command(const std::string& command_data, std::string& result) {
-        /*if (!running_) {
-            std::cout << "[Node " << config_.node_id << "] Not running, cannot propose command" << std::endl;
-            return false;
-        }*/
-        if (state_ != NodeState::LEADER) {
-            std::cout << "[Node " << config_.node_id << "] Not leader, cannot propose command" << std::endl;
-            return false;
+    void ConsensusEngine::propose(std::string command_data, ProposeCallback callback) {
+        if (!running_ || state_ != NodeState::LEADER) {
+            ProposeResult r;
+            r.status = running_ ? ProposeStatus::NOT_LEADER : ProposeStatus::STOPPED;
+            r.leader_hint = leader_id_;
+            callback(std::move(r));
+            return;
         }
 
-        kv::Command cmd;
-        if (!kv::Command::deserialize(command_data, cmd)) {
-            std::cerr << "[Leader " << config_.node_id << "] Failed to parse command" << std::endl;
-            return false;
+        uint64_t term = current_term_;
+        log_->append(LogEntry(term, std::move(command_data)));
+        uint64_t index = log_->get_last_index();
+
+        pending_[index] = PendingProposal{
+            term,
+            steady_clock::now() + milliseconds(config_.propose_timeout),
+            std::move(callback)
+        };
+
+        // Рассылку делает tick: все предложения одной итерации уходят одним AppendEntries
+        replicate_now_ = true;
+    }
+
+    void ConsensusEngine::fail_pending(ProposeStatus status) {
+        auto pending = std::move(pending_);
+        pending_.clear();
+        for (auto& [index, p] : pending) {
+            ProposeResult r;
+            r.status = status;
+            r.leader_hint = get_leader_id();
+            p.callback(std::move(r));
         }
+    }
 
-
-        LogEntry entry(current_term_, command_data);
-        log_->append(entry);
-
-        uint64_t entry_index = log_->get_last_index();
-
-
-        for (uint32_t i = 0; i < config_.total_nodes; ++i) {
-            if (i != config_.node_id) {
-                send_append_entries_to(i);
+    void ConsensusEngine::expire_pending() {
+        auto now = steady_clock::now();
+        for (auto it = pending_.begin(); it != pending_.end();) {
+            if (it->second.deadline <= now) {
+                auto callback = std::move(it->second.callback);
+                it = pending_.erase(it);
+                ProposeResult r;
+                r.status = ProposeStatus::TIMEOUT;
+                r.leader_hint = get_leader_id();
+                callback(std::move(r));
+            }
+            else {
+                ++it;
             }
         }
-
-        auto start = steady_clock::now();
-        while (commit_index_ < entry_index) {
-            auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start);
-            if (elapsed.count() > 5000) {
-                std::cerr << "[Leader " << config_.node_id << "] Command commit timeout after "
-                    << elapsed.count() << "ms" << std::endl;
-                return false;
-            }
-
-            network::VirtualMessage msg;
-            if (transport_->receive(config_.node_id, msg)) {
-                handle_message(msg.type, msg.data, msg.from_id);
-            }
-
-            if (commit_index_ < entry_index) {
-                std::this_thread::sleep_for(milliseconds(50));
-            }
-        }
-
-
-        if (cmd.type == kv::CommandType::GET) {
-            return state_machine_->query(command_data, result);
-        }
-
-
-        return true;
     }
 
     void ConsensusEngine::reset_election_timer() {
@@ -253,12 +251,17 @@ namespace raft {
 
     void ConsensusEngine::send_heartbeats(bool force) {
         auto now = steady_clock::now();
-
         if (!force && duration_cast<milliseconds>(now - last_heartbeat_sent_).count() < config_.heartbeat_interval) {
             return;
         }
 
-        last_heartbeat_sent_ = now;
+        send_append_entries_to_all();
+    }
+
+    void ConsensusEngine::send_append_entries_to_all() {
+        // AppendEntries с новыми записями заодно служит heartbeat
+        last_heartbeat_sent_ = steady_clock::now();
+        replicate_now_ = false;
 
         for (uint32_t i = 0; i < config_.total_nodes; ++i) {
             if (i != config_.node_id) {
@@ -310,9 +313,27 @@ namespace raft {
             }
 
             std::string result;
-            state_machine_->apply(entry.data, result);
+            bool applied = state_machine_->apply(entry.data, result);
 
             last_applied_ = index_to_apply;
+
+            auto it = pending_.find(index_to_apply);
+            if (it != pending_.end()) {
+                auto pending = std::move(it->second);
+                pending_.erase(it);
+                // Другой term по этому индексу: нашу запись заменил новый лидер
+                ProposeResult r;
+                r.leader_hint = get_leader_id();
+                if (entry.term == pending.term) {
+                    r.status = ProposeStatus::OK;
+                    r.applied = applied;
+                    r.result = std::move(result);
+                }
+                else {
+                    r.status = ProposeStatus::LEADERSHIP_LOST;
+                }
+                pending.callback(std::move(r));
+            }
         }
     }
 
@@ -472,10 +493,15 @@ namespace raft {
         }
 
         if (resp.success) {
-            std::lock_guard<std::mutex> lock(leader_mutex_);
-
-            next_index_[from] = resp.match_index + 1;
-            match_index_[from] = resp.match_index;
+            {
+                std::lock_guard<std::mutex> lock(leader_mutex_);
+                // Ответы могут прийти не по порядку: match_index не должен уменьшаться
+                match_index_[from] = std::max(match_index_[from], resp.match_index);
+                next_index_[from] = match_index_[from] + 1;
+            }
+            // Коммитим и отвечаем клиентам сразу, не дожидаясь следующего tick
+            update_commit_index();
+            apply_committed_entries();
         }
         else {
           

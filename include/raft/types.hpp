@@ -3,8 +3,30 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <limits>
 
 namespace raft {
+
+    // Узлы нумеруются с 0, поэтому «нет значения» не может быть 0
+    constexpr uint32_t kNoNode = std::numeric_limits<uint32_t>::max();
+
+    enum class ProposeStatus {
+        OK,               // запись закоммичена и применена к state machine
+        NOT_LEADER,       // узел не лидер; см. leader_hint
+        LEADERSHIP_LOST,  // запись перезаписана новым лидером и не будет применена
+        TIMEOUT,          // за отведённое время запись не закоммичена; исход неизвестен
+        STOPPED           // узел остановлен до того, как запись была применена
+    };
+
+    struct ProposeResult {
+        ProposeStatus status = ProposeStatus::STOPPED;
+        bool applied = false;          // что вернул IStateMachine::apply
+        std::string result;            // результат apply
+        uint32_t leader_hint = kNoNode;
+    };
+
+    // Вызывается ровно один раз, из потока цикла узла: не блокируйте его
+    using ProposeCallback = std::function<void(ProposeResult)>;
 
     namespace network {
         struct VirtualMessage {

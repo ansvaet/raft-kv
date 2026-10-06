@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -11,6 +14,7 @@
 #include "raft/node.hpp"
 #include "network/virtual_transport.hpp"
 #include "kv/state_machine.hpp"
+#include "kv/command.hpp"
 
 using namespace raft;
 using namespace std::chrono_literals;
@@ -34,7 +38,8 @@ namespace {
 
         TestNode make_node(uint32_t id, uint32_t total_nodes = 3,
             uint32_t timeout_ms = kNeverTimeoutMs,
-            std::shared_ptr<network::VirtualTransport> net = nullptr) {
+            std::shared_ptr<network::VirtualTransport> net = nullptr,
+            uint32_t propose_timeout_ms = 5000) {
             if (!net) net = transport;
             for (uint32_t i = 0; i < total_nodes; ++i) net->register_node(i);
 
@@ -43,6 +48,7 @@ namespace {
             cfg.total_nodes = total_nodes;
             cfg.election_timeout_min = timeout_ms;
             cfg.election_timeout_max = timeout_ms;
+            cfg.propose_timeout = propose_timeout_ms;
 
             TestNode node;
             node.log = std::make_shared<LogManager>();
@@ -88,6 +94,17 @@ namespace {
             }
             EXPECT_TRUE(found) << "no VoteResponse sent to node " << to;
             return granted;
+        }
+
+        // Подтверждение от фолловера, что у него есть записи до match_index
+        void ack(ConsensusEngine& leader, uint32_t from, uint64_t match_index) {
+            AppendEntriesResponse resp(leader.get_current_term(), true, match_index);
+            leader.handle_message("AppendEntriesResponse",
+                serializer->serialize_append_entries_response(resp), from);
+        }
+
+        static std::string put(const std::string& key, const std::string& value) {
+            return kv::Command(kv::CommandType::PUT, key, value).serialize();
         }
 
         static void drain(network::VirtualTransport& net, uint32_t node_id) {
@@ -225,4 +242,213 @@ TEST(RaftNodeTest, StoppedLeaderDoesNotReportLeadership) {
     EXPECT_FALSE(leader->is_leader());
 
     for (auto& n : nodes) n->stop();
+}
+
+// ------------------------------------------------------------------
+// Асинхронный propose
+// ------------------------------------------------------------------
+
+TEST_F(ConsensusTest, ProposeOnFollowerFailsWithLeaderHint) {
+    auto node = make_node(1);
+    send_append_entries(*node.engine, 1, 2, 0, 0, {});
+
+    std::optional<ProposeResult> got;
+    node.engine->propose(put("k", "v"), [&](ProposeResult r) { got = std::move(r); });
+
+    ASSERT_TRUE(got.has_value()) << "callback must run immediately on a follower";
+    EXPECT_EQ(got->status, ProposeStatus::NOT_LEADER);
+    EXPECT_EQ(got->leader_hint, 2u);
+    EXPECT_EQ(node.log->get_last_index(), 0u);
+}
+
+TEST_F(ConsensusTest, ProposeCompletesAfterMajorityAckWithApplyResult) {
+    auto node = make_node(0, 3, kShortTimeoutMs);
+    make_leader(node, 3, *transport);
+
+    std::optional<ProposeResult> got;
+    node.engine->propose(put("k", "v"), [&](ProposeResult r) { got = std::move(r); });
+    node.engine->tick();  // рассылает AppendEntries
+    EXPECT_GT(transport->get_queue_size(1), 0u);
+    EXPECT_FALSE(got.has_value()) << "must not complete before a majority has the entry";
+
+    ack(*node.engine, 1, 1);
+
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->status, ProposeStatus::OK);
+    EXPECT_TRUE(got->applied);
+    EXPECT_EQ(got->result, "v");
+}
+
+// Раньше propose возвращал успех, как только commit_index доходил до индекса,
+// даже если по этому индексу закоммичена чужая запись
+TEST_F(ConsensusTest, ProposeReportsLeadershipLostWhenEntryIsOverwritten) {
+    auto node = make_node(0, 3, kShortTimeoutMs);
+    make_leader(node, 3, *transport);
+    uint64_t old_term = node.engine->get_current_term();
+
+    std::optional<ProposeResult> got;
+    node.engine->propose(put("k", "mine"), [&](ProposeResult r) { got = std::move(r); });
+    node.engine->tick();
+
+    // Новый лидер term+1 перезаписывает индекс 1 своей записью и коммитит её
+    AppendEntriesRequest req;
+    req.term = old_term + 1;
+    req.leader_id = 2;
+    req.leader_commit = 1;
+    req.entries = { LogEntry(old_term + 1, put("k", "theirs")) };
+    node.engine->handle_message("AppendEntries", serializer->serialize_append_entries(req), 2);
+    node.engine->tick();
+
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->status, ProposeStatus::LEADERSHIP_LOST);
+    EXPECT_EQ(got->leader_hint, 2u);
+}
+
+TEST_F(ConsensusTest, ProposeTimesOutWithoutMajority) {
+    auto node = make_node(0, 3, kShortTimeoutMs, transport, /*propose_timeout_ms=*/50);
+    make_leader(node, 3, *transport);
+
+    std::optional<ProposeResult> got;
+    node.engine->propose(put("k", "v"), [&](ProposeResult r) { got = std::move(r); });
+    node.engine->tick();
+    EXPECT_FALSE(got.has_value());
+
+    std::this_thread::sleep_for(80ms);
+    node.engine->tick();
+
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->status, ProposeStatus::TIMEOUT);
+}
+
+TEST_F(ConsensusTest, ProposalsInOneIterationShareOneAppendEntries) {
+    auto node = make_node(0, 3, kShortTimeoutMs);
+    make_leader(node, 3, *transport);
+
+    for (int i = 0; i < 5; ++i) {
+        node.engine->propose(put("k" + std::to_string(i), "v"), [](ProposeResult) {});
+    }
+    node.engine->tick();
+
+    EXPECT_EQ(transport->get_queue_size(1), 1u);
+    EXPECT_EQ(node.log->get_last_index(), 5u);
+}
+
+namespace {
+
+    std::string put_command_for_test(int i) {
+        return kv::Command(kv::CommandType::PUT, "key" + std::to_string(i), "v").serialize();
+    }
+
+    struct Cluster {
+        std::shared_ptr<network::VirtualTransport> transport =
+            std::make_shared<network::VirtualTransport>();
+        std::vector<std::unique_ptr<IRaftNode>> nodes;
+
+        explicit Cluster(uint32_t n) {
+            for (uint32_t i = 0; i < n; ++i) {
+                transport->register_node(i);
+                nodes.push_back(create_raft_node(i, n, transport,
+                    std::make_shared<kv::KvStateMachine>()));
+            }
+            for (auto& node : nodes) node->start();
+        }
+        ~Cluster() { for (auto& node : nodes) node->stop(); }
+
+        IRaftNode* wait_for_leader() {
+            for (int i = 0; i < 100; ++i) {
+                for (auto& n : nodes) if (n->is_leader()) return n.get();
+                std::this_thread::sleep_for(50ms);
+            }
+            return nullptr;
+        }
+    };
+
+} // namespace
+
+TEST(RaftNodeTest, ConcurrentProposalsAllCommitExactlyOnce) {
+    Cluster cluster(3);
+    IRaftNode* leader = cluster.wait_for_leader();
+    ASSERT_NE(leader, nullptr);
+
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 50;
+    std::atomic<int> ok{ 0 };
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < kPerThread; ++i) {
+                std::string result;
+                if (leader->propose(put_command_for_test(t * kPerThread + i), result)) ok++;
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    EXPECT_EQ(ok.load(), kThreads * kPerThread);
+    EXPECT_EQ(leader->get_commit_index(), static_cast<uint64_t>(kThreads * kPerThread));
+}
+
+// Блокирующий propose раньше ждал коммита циклом со sleep(50ms)
+TEST(RaftNodeTest, SequentialProposeLatencyIsLow) {
+    Cluster cluster(3);
+    IRaftNode* leader = cluster.wait_for_leader();
+    ASSERT_NE(leader, nullptr);
+
+    constexpr int kOps = 100;
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kOps; ++i) {
+        std::string result;
+        ASSERT_TRUE(leader->propose(put_command_for_test(i), result));
+    }
+    auto per_op = (std::chrono::steady_clock::now() - start) / kOps;
+
+    // При опросе транспорта раз в 1 мс коммит занимает единицы миллисекунд;
+    // порог с запасом для медленных CI и санитайзеров
+    EXPECT_LT(per_op, 25ms);
+}
+
+TEST(RaftNodeTest, ProposeToStoppedNodeFailsImmediately) {
+    Cluster cluster(3);
+    IRaftNode* leader = cluster.wait_for_leader();
+    ASSERT_NE(leader, nullptr);
+    leader->stop();
+
+    std::optional<ProposeResult> got;
+    leader->propose_async(put_command_for_test(0), [&](ProposeResult r) { got = std::move(r); });
+
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->status, ProposeStatus::STOPPED);
+}
+
+TEST(RaftNodeTest, StopCompletesPendingProposals) {
+    // Кластер из 3 узлов, но запущен только будущий лидер: большинства нет,
+    // и предложение висит до остановки
+    auto transport = std::make_shared<network::VirtualTransport>();
+    for (uint32_t i = 0; i < 3; ++i) transport->register_node(i);
+    auto node = create_raft_node(0, 3, transport, std::make_shared<kv::KvStateMachine>());
+    node->start();
+
+    // Делаем узел лидером, отвечая за узел 1 на его VoteRequest
+    Serializer serializer;
+    for (int i = 0; i < 100 && !node->is_leader(); ++i) {
+        std::this_thread::sleep_for(20ms);
+        network::VirtualMessage msg;
+        while (transport->receive(1, msg)) {
+            if (msg.type != "VoteRequest") continue;
+            VoteRequest req;
+            ASSERT_TRUE(serializer.deserialize_vote_request(msg.data, req));
+            transport->send(network::VirtualMessage(1, 0, "VoteResponse",
+                serializer.serialize_vote_response(VoteResponse(req.term, true))));
+        }
+    }
+    ASSERT_TRUE(node->is_leader());
+
+    std::promise<ProposeResult> done;
+    auto future = done.get_future();
+    node->propose_async(put_command_for_test(0), [&](ProposeResult r) { done.set_value(std::move(r)); });
+    std::this_thread::sleep_for(50ms);
+    node->stop();
+
+    ASSERT_EQ(future.wait_for(1s), std::future_status::ready) << "pending proposal was lost";
+    EXPECT_EQ(future.get().status, ProposeStatus::STOPPED);
 }

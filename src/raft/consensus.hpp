@@ -6,13 +6,11 @@
 #include <atomic>
 #include <chrono>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <random>
 
 namespace raft {
-
-    // Узлы нумеруются с 0, поэтому «нет значения» не может быть 0
-    constexpr uint32_t kNoNode = std::numeric_limits<uint32_t>::max();
 
     class IStateMachine;
     class INetworkTransport;
@@ -26,6 +24,7 @@ namespace raft {
             uint32_t election_timeout_min = 150;
             uint32_t election_timeout_max = 300;
             uint32_t heartbeat_interval = 50;
+            uint32_t propose_timeout = 5000;
         };
 
         ConsensusEngine(const Config& config,
@@ -42,7 +41,15 @@ namespace raft {
         void handle_message(const std::string& type, const std::string& data, uint32_t from);
 
 
-        bool propose_command(const std::string& command_data, std::string& result);
+        // Не потокобезопасен: tick, handle_message, propose и fail_pending
+        // должен вызывать один поток (цикл узла). Геттеры ниже можно читать откуда угодно.
+
+        // Лидер дописывает команду в лог; callback вызовется, когда запись
+        // по этому индексу будет применена, по таймауту или при остановке
+        void propose(std::string command_data, ProposeCallback callback);
+
+        // Завершает все ожидающие предложения с указанным статусом
+        void fail_pending(ProposeStatus status);
 
         NodeState get_state() const { return state_; }
         uint64_t get_current_term() const { return current_term_; }
@@ -73,6 +80,8 @@ namespace raft {
 
         void apply_committed_entries();
         void update_commit_index();
+        void expire_pending();
+        void send_append_entries_to_all();
 
         void handle_vote_request(const VoteRequest& req, uint32_t from);
         void handle_vote_response(const VoteResponse& resp, uint32_t from);
@@ -109,6 +118,16 @@ namespace raft {
         std::chrono::steady_clock::time_point election_timeout_;
         std::chrono::steady_clock::time_point last_heartbeat_sent_;
         std::mt19937 rng_{ std::random_device{}() };
+
+        // Предложения, ожидающие применения, по индексу записи в логе
+        struct PendingProposal {
+            uint64_t term;
+            std::chrono::steady_clock::time_point deadline;
+            ProposeCallback callback;
+        };
+        std::map<uint64_t, PendingProposal> pending_;
+        // Есть новые записи, которые нужно разослать, не дожидаясь heartbeat
+        bool replicate_now_ = false;
 
         mutable std::mutex leader_mutex_;
         mutable std::mutex state_mutex_;
