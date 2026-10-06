@@ -4,6 +4,7 @@ project(raft_kv_unit_tests)
 # Модульные тесты используют ту же библиотеку, что и основной проект
 add_executable(unit_tests
     state_machine_test.cpp
+    consensus_test.cpp
 )
 
 target_link_libraries(unit_tests PRIVATE

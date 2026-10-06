@@ -22,18 +22,9 @@ namespace raft {
         , state_machine_(std::move(state_machine))
         , transport_(std::move(transport))
         , serializer_(std::move(serializer))
-        , leader_id_(0)
-        , election_in_progress_(false)
     {
         next_index_.resize(config_.total_nodes, 1);
         match_index_.resize(config_.total_nodes, 0);
-
-        //random election timeout
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dist(config_.election_timeout_min,
-            config_.election_timeout_max);
-        election_timeout_ms_ = dist(gen);
 
         reset_election_timer();
     }
@@ -57,7 +48,7 @@ namespace raft {
 
         case NodeState::CANDIDATE:
             if (election_timeout_elapsed()) {
-                start_election();
+                become_candidate();
             }
             break;
 
@@ -165,8 +156,11 @@ namespace raft {
     }
 
     void ConsensusEngine::reset_election_timer() {
+        // Новый случайный таймаут на каждые выборы, иначе split vote может повторяться
+        std::uniform_int_distribution<uint32_t> dist(config_.election_timeout_min,
+            config_.election_timeout_max);
         last_heartbeat_ = steady_clock::now();
-        election_timeout_ = last_heartbeat_ + milliseconds(election_timeout_ms_);
+        election_timeout_ = last_heartbeat_ + milliseconds(dist(rng_));
     }
 
     bool ConsensusEngine::election_timeout_elapsed() const {
@@ -176,7 +170,7 @@ namespace raft {
     void ConsensusEngine::become_follower(uint64_t term, uint32_t leader_id) {
         if (term > current_term_) {
             current_term_ = term;
-            voted_for_ = 0;
+            voted_for_ = kNoNode;
         }
 
         state_ = NodeState::FOLLOWER;
@@ -196,12 +190,18 @@ namespace raft {
         voted_for_ = config_.node_id;
         votes_received_ = 1;
         election_in_progress_ = true;
-        leader_id_ = 0;
+        leader_id_ = kNoNode;
 
         reset_election_timer();
 
         /*std::cout << "[Node " << config_.node_id << "] Became CANDIDATE in term "
             << current_term_ << std::endl;*/
+
+        // В кластере из одного узла собственного голоса уже достаточно
+        if (votes_received_ > config_.total_nodes / 2) {
+            become_leader();
+            return;
+        }
 
         start_election();
     }
@@ -223,7 +223,8 @@ namespace raft {
         //std::cout << "\n=== Node " << config_.node_id << " became LEADER in term "
         //    << current_term_ << " ===" << std::endl;
 
-        send_heartbeats();
+        // Сразу заявляем о себе, чтобы остальные не начали новые выборы
+        send_heartbeats(/*force=*/true);
     }
 
     void ConsensusEngine::start_election() {
@@ -250,15 +251,14 @@ namespace raft {
         }
     }
 
-    void ConsensusEngine::send_heartbeats() {
-        static auto last_heartbeat_time = steady_clock::now();
+    void ConsensusEngine::send_heartbeats(bool force) {
         auto now = steady_clock::now();
 
-        if (duration_cast<milliseconds>(now - last_heartbeat_time).count() < config_.heartbeat_interval) {
+        if (!force && duration_cast<milliseconds>(now - last_heartbeat_sent_).count() < config_.heartbeat_interval) {
             return;
         }
 
-        last_heartbeat_time = now;
+        last_heartbeat_sent_ = now;
 
         for (uint32_t i = 0; i < config_.total_nodes; ++i) {
             if (i != config_.node_id) {
@@ -352,7 +352,7 @@ namespace raft {
         else {
 
             if (req.term > current_term_) {
-                become_follower(req.term, 0);
+                become_follower(req.term);
                 resp.term = current_term_;
             }
 
@@ -368,7 +368,7 @@ namespace raft {
                 log_ok = false;
             }
 
-            if (log_ok && (voted_for_ == 0 || voted_for_ == from)) {
+            if (log_ok && (voted_for_ == kNoNode || voted_for_ == from)) {
                 resp.vote_granted = true;
                 voted_for_ = from;
                 reset_election_timer();
@@ -387,7 +387,7 @@ namespace raft {
         }
 
         if (resp.term > current_term_) {
-            become_follower(resp.term, 0);
+            become_follower(resp.term);
             return;
         }
 
@@ -415,12 +415,13 @@ namespace raft {
         }
         else {
            
-            if (req.term > current_term_) {
+            // Больший term или легитимный лидер текущего term: кандидат тоже уступает
+            if (req.term > current_term_ || state_ != NodeState::FOLLOWER) {
                 become_follower(req.term, from);
                 resp.term = current_term_;
             }
+            leader_id_ = from;
 
-           
             reset_election_timer();
 
             if (!log_->check_consistency(req.prev_log_index, req.prev_log_term)) {
@@ -430,21 +431,25 @@ namespace raft {
             else {
                 resp.success = true;
 
-               
-                if (!req.entries.empty()) {
-                    log_->truncate_from(req.prev_log_index + 1);
-
-                    
-                    for (const auto& entry : req.entries) {
-                        log_->append(entry);
+                // Обрезаем лог только с первой конфликтующей записи: запоздавший
+                // или повторный запрос не должен удалять уже принятые записи
+                uint64_t index = req.prev_log_index;
+                for (const auto& entry : req.entries) {
+                    ++index;
+                    LogEntry existing;
+                    if (log_->get_entry(index, existing)) {
+                        if (existing.term == entry.term) continue;
+                        log_->truncate_from(index);
                     }
+                    log_->append(entry);
                 }
 
                 resp.match_index = req.prev_log_index + req.entries.size();
 
-               
-                if (req.leader_commit > commit_index_) {
-                    commit_index_ = std::min(req.leader_commit, log_->get_last_index());
+                // Записи после match_index могут быть не подтверждены этим лидером
+                uint64_t new_commit = std::min(req.leader_commit, resp.match_index);
+                if (new_commit > commit_index_) {
+                    commit_index_ = new_commit;
                     //std::cout << "[Node " << config_.node_id << "] Updated commit_index to "
                     //    << commit_index_ << std::endl;
                 }
@@ -462,7 +467,7 @@ namespace raft {
         }
 
         if (resp.term > current_term_) {
-            become_follower(resp.term, 0);
+            become_follower(resp.term);
             return;
         }
 
