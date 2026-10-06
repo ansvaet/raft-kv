@@ -38,6 +38,7 @@ void stress_test() {
     const int OPS_PER_THREAD = 1000;
     std::atomic<long> total_ops{ 0 };
     std::atomic<long> failed{ 0 };
+    std::atomic<long> get_misses{ 0 };
     auto start = std::chrono::steady_clock::now();
 
     auto worker = [&](int tid) {
@@ -54,10 +55,10 @@ void stress_test() {
                     failed++;
             }
             else {
+                // GET возвращает false, если ключ ещё не записан: это не ошибка протокола
                 std::string dummy;
                 if (!leader->query(create_get_command(k), dummy))
-                    failed++; // GET может вернуть false, если нет ключа — это нормально, не считаем ошибкой
-                // Считаем только реальные ошибки протокола
+                    get_misses++;
             }
             total_ops++;
         }
@@ -73,7 +74,8 @@ void stress_test() {
     double throughput = total_ops / elapsed;
 
     std::cout << "Всего операций: " << total_ops << "\n";
-    std::cout << "Ошибок: " << failed << "\n";
+    std::cout << "Ошибок PUT: " << failed << "\n";
+    std::cout << "GET без значения: " << get_misses << "\n";
     std::cout << "Время: " << elapsed << " сек\n";
     std::cout << "Пропускная способность: " << throughput << " ops/sec\n";
 
