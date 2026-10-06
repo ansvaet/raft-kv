@@ -5,7 +5,7 @@ namespace raft {
     namespace test {
 
         void test_single_node_raft_integration() {
-            std::cout << "\n🔬 LEVEL 2: Testing Basic Node Functionality in Cluster" << std::endl;
+            std::cout << "\nLEVEL 2: Testing Basic Node Functionality in Cluster" << std::endl;
 
             auto transport = std::make_shared<network::VirtualTransport>();
             transport->register_node(0);

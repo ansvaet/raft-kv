@@ -18,6 +18,20 @@
 namespace raft {
     namespace test {
 
+        // Создание PUT команды с client_id и request_id (для тестирования идемпотентности)
+        inline std::string create_put_command_with_id(const std::string& key,
+            const std::string& value,
+            uint64_t client_id,
+            uint64_t request_id) {
+            nlohmann::json j;
+            j["type"] = "PUT";
+            j["key"] = key;
+            j["value"] = value;
+            j["client_id"] = client_id;
+            j["request_id"] = request_id;
+            return j.dump();
+        }
+
         // Утилита для генерации уникальных ID запросов
         inline uint64_t generate_request_id() {
             static std::atomic<uint64_t> counter{ 1 };
