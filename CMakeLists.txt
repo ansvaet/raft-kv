@@ -13,6 +13,8 @@ include(FetchContent)
 FetchContent_Declare(
     nlohmann_json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.2
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
@@ -20,6 +22,7 @@ FetchContent_Declare(
     googletest
     GIT_REPOSITORY https://github.com/google/googletest.git
     GIT_TAG v1.14.0
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(googletest)
 
@@ -91,6 +94,7 @@ set_target_properties(raft_kv PROPERTIES
 # ------------------------------------------------------------------
 # Подключение тестов (только после определения библиотеки)
 # ------------------------------------------------------------------
+enable_testing()
 add_subdirectory(tests/integration)
 add_subdirectory(tests/unit)
 # Системные тесты

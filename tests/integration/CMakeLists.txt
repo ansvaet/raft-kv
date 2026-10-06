@@ -39,3 +39,6 @@ endif()
 set_target_properties(integration_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
+add_test(NAME integration_tests COMMAND integration_tests)
+set_tests_properties(integration_tests PROPERTIES TIMEOUT 120)
