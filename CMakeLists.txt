@@ -6,6 +6,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)
 
 # ------------------------------------------------------------------
+# Санитайзеры: -DRAFT_SANITIZER=thread или address.
+# Задаются до зависимостей, чтобы GoogleTest тоже был инструментирован.
+# ------------------------------------------------------------------
+set(RAFT_SANITIZER "" CACHE STRING "Sanitizer to build with: thread, address or empty")
+if(RAFT_SANITIZER)
+    if(MSVC)
+        message(FATAL_ERROR "RAFT_SANITIZER is supported only with GCC/Clang")
+    endif()
+    add_compile_options(-fsanitize=${RAFT_SANITIZER} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${RAFT_SANITIZER})
+endif()
+
+# ------------------------------------------------------------------
 # Зависимости: nlohmann/json и Google Test
 # ------------------------------------------------------------------
 include(FetchContent)

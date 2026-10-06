@@ -47,6 +47,23 @@ cmake ..
 make
 ```
 
+### Tests
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+Use Debug: integration and system tests check results with `assert`.
+
+### Sanitizers
+```bash
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DRAFT_SANITIZER=thread   # or address
+cmake --build build-tsan -j
+setarch $(uname -m) -R ctest --test-dir build-tsan --output-on-failure
+```
+`setarch -R` disables ASLR: GCC 13 TSan aborts with "unexpected memory mapping"
+on kernels with high mmap entropy. CI runs plain, TSan and ASan builds.
+
 
 ### Interactive Commands
 ```
