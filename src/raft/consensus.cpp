@@ -6,6 +6,7 @@
 #include <chrono>
 #include <algorithm>
 #include <iostream>
+#include <thread>
 
 namespace raft {
 
