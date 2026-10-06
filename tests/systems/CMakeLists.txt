@@ -37,3 +37,7 @@ endif()
 set_target_properties(system_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
+# Тесты проверяются через assert, поэтому имеют смысл только в Debug
+add_test(NAME system_tests COMMAND system_tests)
+set_tests_properties(system_tests PROPERTIES TIMEOUT 300)
