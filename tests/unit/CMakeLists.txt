@@ -30,4 +30,6 @@ set_target_properties(unit_tests PROPERTIES
 
 # Автоматическая регистрация тестов в CTest
 include(GoogleTest)
-gtest_discover_tests(unit_tests)
+# PRE_TEST: список тестов собирается при запуске ctest, а не после сборки.
+# Иначе TSan-бинарник падает при обнаружении, если ctest запущен под setarch -R
+gtest_discover_tests(unit_tests DISCOVERY_MODE PRE_TEST)
