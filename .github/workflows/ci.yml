@@ -11,15 +11,32 @@ concurrency:
 
 jobs:
   build-and-test:
+    name: build-and-test (${{ matrix.sanitizer || 'plain' }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: ["", thread, address]
+
+    env:
+      # Любой отчёт санитайзера должен валить тест, а не только печататься
+      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+      ASAN_OPTIONS: halt_on_error=1 detect_leaks=1
 
     steps:
       - uses: actions/checkout@v4
 
+      # TSan из GCC 13 падает с "unexpected memory mapping" при высокой
+      # энтропии ASLR, которая включена в ядрах GitHub-раннеров
+      - name: Lower ASLR entropy for TSan
+        if: matrix.sanitizer == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
       # Debug: system и integration тесты проверяют результат через assert
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DRAFT_SANITIZER=${{ matrix.sanitizer }}
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
