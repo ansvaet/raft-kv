@@ -4,8 +4,11 @@
 #include "log_manager.hpp"
 #include "serializer.hpp"
 #include <atomic>
-#include <thread>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 namespace raft {
 
@@ -26,6 +29,7 @@ namespace raft {
         uint32_t get_id() const override { return config_.node_id; }
         bool is_leader() const override;
 
+        void propose_async(std::string command_data, ProposeCallback callback) override;
         bool propose(const std::string& command_data, std::string& result) override;
         bool query(const std::string& query_data, std::string& result) override;
 
@@ -46,6 +50,16 @@ namespace raft {
 
         std::atomic<bool> running_{ false };
         std::thread worker_thread_;
+
+        // Входящие предложения от других потоков; консенсус трогает только worker_thread_
+        struct Proposal {
+            std::string command;
+            ProposeCallback callback;
+        };
+        std::mutex inbox_mutex_;
+        std::condition_variable inbox_cv_;
+        std::deque<Proposal> inbox_;
+        bool accepting_ = false;  // под inbox_mutex_: цикл ещё примет предложение
     };
 
 } 

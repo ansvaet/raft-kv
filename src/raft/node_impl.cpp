@@ -1,6 +1,8 @@
 #include "node_impl.hpp"
 #include <iostream>
 #include <chrono>
+#include <future>
+#include <stdexcept>
 
 namespace raft {
 
@@ -34,6 +36,10 @@ namespace raft {
         consensus_ = std::make_unique<ConsensusEngine>(
             config_, log_manager_, state_machine_, transport_, serializer_
         );
+        {
+            std::lock_guard<std::mutex> lock(inbox_mutex_);
+            accepting_ = true;
+        }
         running_ = true;
         worker_thread_ = std::thread(&RaftNodeImpl::run_loop, this);
     }
@@ -42,7 +48,11 @@ namespace raft {
         if (!running_) {
             return;
         }
-        running_ = false;
+        {
+            std::lock_guard<std::mutex> lock(inbox_mutex_);
+            running_ = false;
+        }
+        inbox_cv_.notify_all();
 
         if (consensus_) {
             consensus_->stop();
@@ -51,15 +61,44 @@ namespace raft {
         if (worker_thread_.joinable()) {
             worker_thread_.join();
         }
-
     }
 
     void RaftNodeImpl::run_loop() {
         using namespace std::chrono;
+        // Входящие сообщения транспорта пока опрашиваются, поэтому цикл просыпается
+        // и по таймеру; новое предложение будит его сразу
+        constexpr auto kPollInterval = milliseconds(1);
 
+        std::deque<Proposal> batch;
         while (running_) {
+            {
+                std::lock_guard<std::mutex> lock(inbox_mutex_);
+                batch.swap(inbox_);
+            }
+            for (auto& p : batch) {
+                consensus_->propose(std::move(p.command), std::move(p.callback));
+            }
+            batch.clear();
+
             consensus_->tick();
-            std::this_thread::sleep_for(milliseconds(10));
+
+            std::unique_lock<std::mutex> lock(inbox_mutex_);
+            inbox_cv_.wait_for(lock, kPollInterval,
+                [this] { return !inbox_.empty() || !running_; });
+        }
+
+        // После этого propose_async сразу отвечает STOPPED, так что ни один
+        // callback не потеряется
+        {
+            std::lock_guard<std::mutex> lock(inbox_mutex_);
+            accepting_ = false;
+            batch.swap(inbox_);
+        }
+        consensus_->fail_pending(ProposeStatus::STOPPED);
+        for (auto& p : batch) {
+            ProposeResult r;
+            r.status = ProposeStatus::STOPPED;
+            p.callback(std::move(r));
         }
     }
 
@@ -75,8 +114,36 @@ namespace raft {
         return consensus_->is_leader();
     }
 
+    void RaftNodeImpl::propose_async(std::string command_data, ProposeCallback callback) {
+        {
+            std::lock_guard<std::mutex> lock(inbox_mutex_);
+            if (accepting_) {
+                inbox_.push_back(Proposal{ std::move(command_data), std::move(callback) });
+                inbox_cv_.notify_one();
+                return;
+            }
+        }
+        ProposeResult r;
+        r.status = ProposeStatus::STOPPED;
+        callback(std::move(r));
+    }
+
     bool RaftNodeImpl::propose(const std::string& command_data, std::string& result) {
-        return consensus_->propose_command(command_data, result);
+        // Из потока узла ждать нельзя: этот же поток должен закоммитить запись
+        if (std::this_thread::get_id() == worker_thread_.get_id()) {
+            throw std::logic_error("RaftNodeImpl::propose called from the node thread");
+        }
+
+        auto promise = std::make_shared<std::promise<ProposeResult>>();
+        auto future = promise->get_future();
+        propose_async(command_data, [promise](ProposeResult r) {
+            promise->set_value(std::move(r));
+        });
+
+        // Завершение гарантировано: commit, propose_timeout или остановка узла
+        ProposeResult r = future.get();
+        result = std::move(r.result);
+        return r.status == ProposeStatus::OK;
     }
 
     bool RaftNodeImpl::query(const std::string& query_data, std::string& result) {
